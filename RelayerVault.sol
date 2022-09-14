@@ -16,6 +16,8 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
     //Internal addresses for payouts
     address public feeAddress;
 
+    address public harvestor;
+
     //List of addresses that hold the CXO in the pool
     address[] public holdingCells;
 
@@ -23,10 +25,12 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
 
     uint256 public cellPointer = 0;
 
+    event FeeChanged(uint cellNumber, uint newValue);
 
-    constructor(address _depositToken, address _feeAddress) ERC20("CXORelayerReceipt", "CXORR") {
+    constructor(address _depositToken, address _feeAddress, address _harvestor) ERC20("CXORelayerReceipt", "CXORR") {
         depositToken = IERC20(_depositToken);
         feeAddress = _feeAddress;
+        harvestor = _harvestor;
         holdingCells.push(address(new HoldingCell(address(this))));
     }
 
@@ -35,7 +39,7 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
     //=======================================
 
     function _deposit(uint256 _amt) internal {
-        require(_amt <= 250000*10^18, "Can't Deposit more than 1 relayer at a time"); //Cap it out at 250k tokens deposit
+        require(_amt <= 250000*10**18, "Can't Deposit more than 1 relayer at a time"); //Cap it out at 250k tokens deposit
         uint256 pooled = balance;    //balance at the time
         depositToken.safeTransferFrom(msg.sender, address(this), _amt);
         //Deposit the tokens here
@@ -51,18 +55,6 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
         _mint(msg.sender, shares);
     }
 
-    //All excess reward CXO that has been collecting in the vault from the cell harvests gets reinvested
-    function spreadExcess() public {
-        uint excessTokens = depositToken.balanceOf(address(this));  //Get the tokens sitting in the vault from harvested cells
-        if(excessTokens > 250000*10^18) {
-            //We have more than 250k tokens in rewards to spread
-            //Spread is capped at 250k tokens
-            excessTokens = 250000*10^18;
-        }
-        _spread(excessTokens);
-        balance += excessTokens;    //Add those tokens to our total balance of deposits
-    }
-
     //Sends the CXO to the underlying holding cells
     function _spread(uint256 _amt) internal {
         //At most we can get is 250k cxo
@@ -71,7 +63,7 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
             //We will never have a holdingCells[p+1] with more than 0 CXO in it
         HoldingCell currentCell = HoldingCell(holdingCells[cellPointer]);
         uint totalDeposits = currentCell.deposits(); //Get our deposits in this cell
-        uint canDeposit = (250000*10^18) - totalDeposits;
+        uint canDeposit = (250000*10**18) - totalDeposits;
         if(canDeposit >= _amt) {
             //Deposit here
             depositToken.safeTransfer(address(currentCell), _amt);
@@ -101,7 +93,7 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
 
     function _withdraw(uint256 _shares) internal {
         uint256 r = (balance * _shares) / totalSupply();
-        require(r <= 250000*10^18, "Can't withdraw more than 1 relayer at a time");
+        require(r <= 250000*10**18, "Can't withdraw more than 1 relayer at a time");
         _burn(msg.sender, _shares);
 
         _retract(r);
@@ -116,6 +108,7 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
             //then pull the rest from the next one
             //We will never have a holdingCells[p-1] with less than 0 CXO in it
             //Going to need an extra check for p = 0
+        balance -= _amt;
         HoldingCell currentCell = HoldingCell(holdingCells[cellPointer]);
         uint totalDeposits = currentCell.deposits(); //Get our deposits in this cell
         if(_amt <= totalDeposits) {
@@ -144,9 +137,9 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
     //Cap deposit all at 250k so we don't throw an error when you have more than 250k cxo
     function depositAll() public nonReentrant {
         uint amt = depositToken.balanceOf(msg.sender);
-        if(amt > 250000*10^18) {
+        if(amt > 250000*10**18) {
             //over 250k deposit so set it to 250k
-            amt = 250000*10^18;
+            amt = 250000*10**18;
         }
         _deposit(amt);
     }
@@ -156,14 +149,14 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
         _deposit(_amt);
     }
 
-    //Cap withdraw all at 250k so we don't thrown an error when you have more than 250k cxo 
+    //Cap withdraw all at 250k so we don't throw an error when you have more than 250k cxo 
     function withdrawAll() public nonReentrant {
-        uint amt = depositToken.balanceOf(msg.sender);
+        uint amt = balanceOf(msg.sender); //Get the total number of shares this user has
         uint256 r = (balance * amt) / totalSupply();
-        if(r > 250000*10^18) {
+        if(r > 250000*10**18) {
             //over 250k withdraw so set it to 250k
             //x = bal * shares / ts >> (x*ts) = bal * shares >> (x*ts) / bal = shares
-            amt = ((250000*10^18) * totalSupply()) / balance;
+            amt = ((250000*10**18) * totalSupply()) / balance;
         }
         _withdraw(amt);
     }
@@ -173,18 +166,44 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
         _withdraw(_amt);
     }
 
+    //===========================================
+    //========== Compounding Functions ==========
+    //===========================================
+
+    //All excess reward CXO that has been collecting in the vault from the cell harvests gets reinvested
+    function spreadExcess() public onlyHarvestor {
+        uint excessTokens = depositToken.balanceOf(address(this));  //Get the tokens sitting in the vault from harvested cells
+        if(excessTokens > 250000*10**18) {
+            //We have more than 250k tokens in rewards to spread
+            //Spread is capped at 250k tokens
+            excessTokens = 250000*10**18;
+        }
+        _spread(excessTokens);
+        balance += excessTokens;    //Add those tokens to our total balance of deposits
+    }
+
+    //How we pull fees as the owner and spread out rewards, call each one daily!
+    function harvest(uint cellNumber) public onlyHarvestor {
+        HoldingCell(holdingCells[cellNumber]).harvest();
+    }
+
     //=====================================
     //========== Owner Functions ==========
     //=====================================
 
-    //How we pull fees as the owner and spread out rewards, call each one daily!
-    function harvest(uint cellNumber) public onlyOwner {
-        HoldingCell(holdingCells[cellNumber]).harvest();
-    }
-
     //Capped in the holding cell at 10% (100 / 1000)
     function changeFees(uint256 newFee, uint256 cellNumber) public onlyOwner {
         HoldingCell(holdingCells[cellNumber]).changeFees(newFee);
+        emit FeeChanged(cellNumber, newFee);
+    }
+
+    function changeHarvestor(address _harvestor) public onlyOwner {
+        harvestor = _harvestor;
+    }
+
+    modifier onlyHarvestor() {
+        require(msg.sender == harvestor);
+        _;
     }
 
 
@@ -193,7 +212,7 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
     //===========================
 
     function getPricePerFullShare() public view returns (uint256) {
-        return totalSupply() == 0 ? 1*10^18 : (balance * 1*10^18) / totalSupply();
+        return totalSupply() == 0 ? 1*10**18 : (balance * 1*10**18) / totalSupply();
     }
 
     //returns true if the cell has no deposits
@@ -206,6 +225,13 @@ contract RelayerVault is ReentrancyGuard, Ownable, ERC20 {
         return depositToken.balanceOf(holdingCells[cell]) == 0;
     }
 
+    function getUserDeposits(address _user) public view returns(uint256) {
+        uint amt = balanceOf(_user); //Get the total number of shares this user has
+        return (balance * amt) / totalSupply();
+    }
+
+    
+
 }
 
 contract HoldingCell {
@@ -215,6 +241,8 @@ contract HoldingCell {
 
     uint256 public deposits = 0;
     uint256 public fee = 30;
+
+    event Harvest(uint256 fees, uint256 rewards);
 
     constructor(address _vault) {
         vault = RelayerVault(_vault);
@@ -234,14 +262,15 @@ contract HoldingCell {
         //Get the amount of non deposited cxo and send it to the main contract to be claimed
         uint256 rewards = vault.depositToken().balanceOf(address(this)) - deposits;
 
-        uint256 fees = rewards * (fee / 1000);  
+        uint256 fees = (rewards * fee) / 1000;  
+        emit Harvest(fees, rewards);
 
         vault.depositToken().safeTransfer(vault.feeAddress(), fees);
 
         uint256 userRewards = rewards - fees;
 
         vault.depositToken().safeTransfer(address(vault), userRewards);
-        vault.spreadExcess();
+        //vault.spreadExcess();
     }
 
     function changeFees(uint256 _fee) public onlyVault {
